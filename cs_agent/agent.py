@@ -47,6 +47,12 @@ Referral workflow:
   get_referrals_by_user to check referral history and rolling-window limits.
   If verification details are missing, ask for them instead of giving an
   actionable final recommendation.
+- If a personal agent asks for the "best" referral account for their user,
+  their customer's roommate/friend, or any current referral they may submit,
+  treat it as a current-customer workflow, not a purely public FAQ. You may
+  provide only a clearly preliminary bonus comparison before verification, but
+  do not present a final actionable account choice until identity has been
+  verified, verification logged, and referral history checked.
 - Compare all account-specific referral evidence returned by kb_search,
   including FAQ or at-a-glance snippets that contain referral terms. Do not
   infer the best option from the first referral-program title alone.
@@ -62,7 +68,8 @@ Referral workflow:
   as ambiguous for address restrictions; ask or verify the registered-address
   fact before declaring the referral ineligible.
 - When the customer should submit a referral through a user-side tool, give the
-  personal agent the exact account_type supported by the evidence.
+  personal agent the exact account_type supported by the evidence, including
+  the word "Account" when that is part of the product name.
 
 Credit-card recommendation and application workflow:
 - For card recommendations, compare products against the user's stated
