@@ -136,6 +136,67 @@ _INTENT_TERMS = {
     "dispute": ("dispute", "fraud", "unauthorized", "charge", "transaction"),
 }
 _CATALOG_TEXT_LIMIT = 4000
+_REFERRER_BONUS_PATTERNS = [
+    r"you earn(?:s)?(?:\:)?\s*\$([0-9,]+)",
+    r"you earn\s*\|\s*\$([0-9,]+)",
+    r"your reward(?:\:)?\s*\$([0-9,]+)",
+    r"your bonus(?:\:)?\s*\$([0-9,]+)",
+    r"your bonus\s*\|\s*\$([0-9,]+)",
+    r"you receive(?:\:)?\s*\$([0-9,]+)",
+    r"referrer bonus(?:\:)?\s*\$([0-9,]+)",
+    r"referrer bonus\s*\|\s*\$([0-9,]+)",
+    r"referral bonus(?:\:)?\s*\$([0-9,]+) for each successful referral",
+    r"earn \$([0-9,]+) for each successful referral",
+    r"referral bonus \(you earn\)\s*\|\s*\$([0-9,]+)",
+]
+_REFERRED_BONUS_PATTERNS = [
+    r"person you refer receives \$([0-9,]+)",
+    r"they receive(?:\:)?\s*\$([0-9,]+)",
+    r"they receive\s*\|\s*\$([0-9,]+)",
+    r"their bonus(?:\:)?\s*\$([0-9,]+)",
+    r"their bonus\s*\|\s*\$([0-9,]+)",
+    r"they earn\s*\|\s*\$([0-9,]+)",
+    r"new member reward(?:\:)?\s*\$([0-9,]+)",
+    r"new member bonus(?:\:)?\s*\$([0-9,]+)",
+    r"new member bonus\s*\|\s*\$([0-9,]+)",
+    r"welcome bonus(?:\:)?\s*\$([0-9,]+)",
+    r"welcome bonus\s*\|\s*\$([0-9,]+)",
+    r"new members receive \$([0-9,]+)",
+    r"referral bonus \(they receive\)\s*\|\s*\$([0-9,]+)",
+]
+_REQUIRED_DEPOSIT_PATTERNS = [
+    r"deposit at least \$([0-9,]+)",
+    r"required deposit\s*\|\s*\$([0-9,]+)",
+    r"minimum deposit\s*\|\s*\$([0-9,]+)",
+    r"qualifying deposit(?: required)?(?:\:)?\s*\$([0-9,]+)",
+    r"qualifying deposit\s*\|\s*\$([0-9,]+)",
+    r"qualifying requirement(?:\:)?\s*referred person must deposit \$([0-9,]+)",
+    r"must deposit(?: at least)? \$([0-9,]+)",
+]
+_ANNUAL_LIMIT_PATTERNS = [
+    r"annual limit(?:\:)?\s*([0-9]+)",
+    r"annual cap\s*\|\s*([0-9]+)",
+    r"annual maximum(?:\:)?\s*([0-9]+)",
+    r"max(?:imum)? referrals(?: per year)?(?:\:)?\s*([0-9]+)",
+    r"max per year\s*\|\s*([0-9]+)",
+    r"up to ([0-9]+) referral bonuses per calendar year",
+    r"earn up to ([0-9]+) referral bonuses per calendar year",
+]
+_DEPOSIT_WINDOW_PATTERNS = [
+    r"within ([0-9]+) days of (?:opening|account opening)",
+    r"deposit window\s*\|\s*([0-9]+)\s*days",
+    r"deposit deadline\s*\|\s*([0-9]+)\s*days",
+]
+_TENURE_PATTERNS = [
+    r"minimum banking relationship of ([0-9]+) days",
+    r"checking relationship must span at least ([0-9]+) days",
+    r"referrer tenure\s*\|\s*([0-9]+)\s*days",
+    r"tenure required\s*\|\s*([0-9]+)\s*days",
+    r"customer tenure\s*\|\s*([0-9]+)\s*days",
+    r"participation requires ([0-9]+) days",
+    r"account tenure requirement(?:\:)?\s*([0-9]+) days",
+    r"at least ([0-9]+) days prior",
+]
 
 
 def _get_genai_client():
@@ -343,6 +404,14 @@ def _first_money(text: str, patterns: list[str]) -> float | None:
     return None
 
 
+def _first_int(text: str, patterns: list[str]) -> int | None:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return None
+
+
 def _query_deposit_amount(terms: list[str]) -> float | None:
     amounts = []
     for term in terms:
@@ -354,44 +423,143 @@ def _query_deposit_amount(terms: list[str]) -> float | None:
 
 
 def _referral_numeric_boost(content_l: str, profile: dict) -> float:
-    referrer = _first_money(
-        content_l,
-        [
-            r"you earn(?:s)?(?:\:)?\s*\$([0-9,]+)",
-            r"your reward(?:\:)?\s*\$([0-9,]+)",
-            r"referrer bonus\s*\|\s*\$([0-9,]+)",
-            r"earn \$([0-9,]+) for each successful referral",
-        ],
-    )
-    referred = _first_money(
-        content_l,
-        [
-            r"person you refer receives \$([0-9,]+)",
-            r"they receive(?:\:)?\s*\$([0-9,]+)",
-            r"new member reward(?:\:)?\s*\$([0-9,]+)",
-            r"new member bonus\s*\|\s*\$([0-9,]+)",
-        ],
-    )
+    referrer = _first_money(content_l, _REFERRER_BONUS_PATTERNS)
+    referred = _first_money(content_l, _REFERRED_BONUS_PATTERNS)
     if referrer is None and referred is None:
         return 0.0
 
     boost = ((referrer or 0.0) + (referred or 0.0)) / 2
     requested_deposit = _query_deposit_amount(profile["query_terms"])
-    required_deposit = _first_money(
-        content_l,
-        [
-            r"deposit at least \$([0-9,]+)",
-            r"required deposit\s*\|\s*\$([0-9,]+)",
-            r"qualifying deposit\s*\|\s*\$([0-9,]+)",
-            r"must deposit \$([0-9,]+)",
-        ],
-    )
+    required_deposit = _first_money(content_l, _REQUIRED_DEPOSIT_PATTERNS)
     if requested_deposit is not None and required_deposit is not None:
         if required_deposit <= requested_deposit:
             boost += 25
         else:
             boost -= 35
     return boost
+
+
+def _account_type_from_doc(doc: dict) -> str | None:
+    title = re.sub(r"^faq:\s*", "", doc.get("title", ""), flags=re.IGNORECASE).strip()
+    match = re.search(
+        r"\b([A-Z][A-Za-z0-9-]*(?:\s+[A-Z][A-Za-z0-9-]*)*\s+Account\s*\([^)]+\))",
+        title,
+    )
+    if match:
+        return match.group(1).strip()
+
+    match = re.search(
+        r"\b([A-Z][A-Za-z0-9-]*(?:\s+[A-Z][A-Za-z0-9-]*)*\s+Account(?:\s*\([^)]+\))?)\b",
+        title,
+    )
+    if match:
+        return match.group(1).strip()
+
+    doc_id = doc.get("doc_id", "")
+    match = re.search(r"doc_checking_accounts_(.+?)_\d+$", doc_id)
+    if not match:
+        return None
+    words = match.group(1).replace("_", " ").split()
+    if not words:
+        return None
+    return " ".join(word[:1].upper() + word[1:] for word in words)
+
+
+def _referral_facts(content: str) -> dict:
+    return {
+        "referrer_bonus": _first_money(content, _REFERRER_BONUS_PATTERNS),
+        "referred_bonus": _first_money(content, _REFERRED_BONUS_PATTERNS),
+        "required_deposit": _first_money(content, _REQUIRED_DEPOSIT_PATTERNS),
+        "annual_limit": _first_int(content, _ANNUAL_LIMIT_PATTERNS),
+        "deposit_window_days": _first_int(content, _DEPOSIT_WINDOW_PATTERNS),
+        "referrer_tenure_days": _first_int(content, _TENURE_PATTERNS),
+    }
+
+
+def _referral_options(query: str, docs: list[dict]) -> list[dict]:
+    profile = _query_profile(query)
+    if not profile["referral"] or profile["business"]:
+        return []
+
+    requested_deposit = _query_deposit_amount(profile["query_terms"])
+    by_account: dict[str, dict] = {}
+    for doc in docs:
+        doc_id = doc.get("doc_id", "")
+        title = doc.get("title", "")
+        content = doc.get("content", "")
+        doc_text = f"{title} {content}".lower()
+        if _doc_is_business(doc_id, title) or "doc_checking_accounts_" not in doc_id:
+            continue
+        if "referral" not in doc_text and "refer" not in doc_text:
+            continue
+
+        account_type = _account_type_from_doc(doc)
+        if not account_type:
+            continue
+
+        facts = _referral_facts(content)
+        if not any(value is not None for value in facts.values()):
+            continue
+
+        option = by_account.setdefault(
+            account_type,
+            {
+                "account_type": account_type,
+                "referrer_bonus": None,
+                "referred_bonus": None,
+                "combined_bonus": 0.0,
+                "required_deposit": None,
+                "eligible_for_requested_deposit": None,
+                "annual_limit": None,
+                "deposit_window_days": None,
+                "referrer_tenure_days": None,
+                "source_doc_ids": [],
+                "source_titles": [],
+            },
+        )
+        for key in (
+            "referrer_bonus",
+            "referred_bonus",
+            "required_deposit",
+            "annual_limit",
+            "deposit_window_days",
+            "referrer_tenure_days",
+        ):
+            if option[key] is None and facts[key] is not None:
+                option[key] = facts[key]
+        if doc_id not in option["source_doc_ids"]:
+            option["source_doc_ids"].append(doc_id)
+        if title and title not in option["source_titles"]:
+            option["source_titles"].append(title)
+
+    options = []
+    for option in by_account.values():
+        option["combined_bonus"] = round(
+            (option["referrer_bonus"] or 0.0) + (option["referred_bonus"] or 0.0),
+            2,
+        )
+        if requested_deposit is not None and option["required_deposit"] is not None:
+            option["eligible_for_requested_deposit"] = (
+                option["required_deposit"] <= requested_deposit
+            )
+        options.append(option)
+
+    options = [
+        option
+        for option in options
+        if option["referrer_bonus"] is not None or option["referred_bonus"] is not None
+    ]
+
+    def sort_key(option: dict) -> tuple:
+        eligible = option["eligible_for_requested_deposit"]
+        return (
+            0 if eligible is True else 1 if eligible is None else 2,
+            -option["combined_bonus"],
+            option["required_deposit"] or 999999999,
+            option["account_type"],
+        )
+
+    return sorted(options, key=sort_key)[:8]
 
 
 def _doc_score(doc: dict, profile: dict) -> float:
@@ -700,13 +868,16 @@ def kb_search(query: str, top_k: int = 8, use_vector_fallback: bool = True) -> d
             docs.extend(_from_cached(_bm25_cached(or_query, candidate_limit)))
         catalog_docs = _catalog_candidates(query)
         docs.extend(catalog_docs)
+        referral_options = _referral_options(query, docs)
         results = _compact_results(docs, query, "bm25", top_k)
         used_vector = False
         min_needed = min(3, top_k)
         best_score = results[0]["rank_score"] if results else 0
         bm25_insufficient = len(results) < min_needed or best_score < 10
         specific_terms = _important_terms(query)
-        vector_allowed = len(specific_terms) >= 3 and len(query.strip()) >= 24
+        # Embeddings are high-latency and have mostly hurt short follow-up
+        # searches. Keep vector fallback for substantial natural-language gaps.
+        vector_allowed = len(specific_terms) >= 4 and len(query.strip()) >= 40
         vector_skipped_reason = None
         if use_vector_fallback and bm25_insufficient and vector_allowed:
             vector_docs = kb_search_vector(query, top_k=top_k)
@@ -727,6 +898,7 @@ def kb_search(query: str, top_k: int = 8, use_vector_fallback: bool = True) -> d
             result_count=len(results),
             bm25_query_count=len(bm25_queries),
             catalog_candidate_count=len(catalog_docs),
+            referral_option_count=len(referral_options),
             used_vector=used_vector,
             vector_skipped_reason=vector_skipped_reason,
             best_bm25_score=best_score,
@@ -742,10 +914,14 @@ def kb_search(query: str, top_k: int = 8, use_vector_fallback: bool = True) -> d
             "vector_skipped_reason": vector_skipped_reason,
             "result_count": len(results),
             "results": results,
+            "referral_options": referral_options,
+            "best_referral_option": referral_options[0] if referral_options else None,
             "guidance": (
                 "Use these snippets as evidence. If they answer the policy/tool "
                 "question, stop searching and act. If they are insufficient, run "
-                "one more specific kb_search query."
+                "one more specific kb_search query. If referral_options is present, "
+                "use that structured table for the numeric referral comparison and "
+                "do not run more KB searches for the same account comparison."
             ),
         }
     except Exception as exc:

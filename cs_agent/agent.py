@@ -50,6 +50,14 @@ Referral workflow:
 - Compare all account-specific referral evidence returned by kb_search,
   including FAQ or at-a-glance snippets that contain referral terms. Do not
   infer the best option from the first referral-program title alone.
+- When kb_search returns referral_options, use that structured table for the
+  numeric comparison; do not perform additional KB searches for the same
+  account comparison.
+- After identity is verified, verification is logged, and get_referrals_by_user
+  has been checked for a checking-account referral, finish the referral answer
+  with eligibility and the exact account_type. Do not inspect credit-card
+  accounts or discoverable tool catalogs for a checking-account referral unless
+  the user explicitly asks about credit cards or tool availability.
 - Treat relationship words such as roommate, friend, partner, or family member
   as ambiguous for address restrictions; ask or verify the registered-address
   fact before declaring the referral ineligible.
