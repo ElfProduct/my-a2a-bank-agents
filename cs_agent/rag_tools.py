@@ -118,8 +118,6 @@ _BUSINESS_TERMS = {
     "business",
     "businesses",
     "commercial",
-    "company",
-    "companies",
     "corporate",
     "corporation",
     "llc",
@@ -196,6 +194,30 @@ _TENURE_PATTERNS = [
     r"participation requires ([0-9]+) days",
     r"account tenure requirement(?:\:)?\s*([0-9]+) days",
     r"at least ([0-9]+) days prior",
+]
+_CARD_NAMES_BY_DOC_SLUG = {
+    "bronze_rewards_card": "Bronze Rewards Card",
+    "silver_rewards_card": "Silver Rewards Card",
+    "gold_rewards_card": "Gold Rewards Card",
+    "platinum_rewards_card": "Platinum Rewards Card",
+    "diamond_elite_card": "Diamond Elite Card",
+    "crypto-cash_back": "Crypto-Cash Back Card",
+    "ecocard": "EcoCard",
+    "green_rewards_card": "Green Rewards Card",
+}
+_ANNUAL_FEE_PATTERNS = [
+    r"annual fee(?:\:)?\s*\$([0-9,]+(?:\.[0-9]+)?)",
+    r"annual fee\s*\|\s*\$([0-9,]+(?:\.[0-9]+)?)",
+]
+_FLAT_CASHBACK_PATTERNS = [
+    r"cash back on all purchases(?:\:)?\s*([0-9]+(?:\.[0-9]+)?)%",
+    r"([0-9]+(?:\.[0-9]+)?)%\s+cash back on all(?: eligible)? purchases",
+    r"earn rewards at\s*([0-9]+(?:\.[0-9]+)?)%",
+    r"purchases outside top categories earn\s*([0-9]+(?:\.[0-9]+)?)%\s+back",
+]
+_MIN_CREDIT_SCORE_PATTERNS = [
+    r"minimum credit score(?: required)?(?: to apply)?(?:\:)?\s*\$?([0-9]+)",
+    r"minimum score requirement is\s*\$?([0-9]+)",
 ]
 
 
@@ -412,6 +434,14 @@ def _first_int(text: str, patterns: list[str]) -> int | None:
     return None
 
 
+def _first_float(text: str, patterns: list[str]) -> float | None:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return float(match.group(1).replace(",", ""))
+    return None
+
+
 def _query_deposit_amount(terms: list[str]) -> float | None:
     amounts = []
     for term in terms:
@@ -557,6 +587,149 @@ def _referral_options(query: str, docs: list[dict]) -> list[dict]:
             -option["combined_bonus"],
             option["required_deposit"] or 999999999,
             option["account_type"],
+        )
+
+    return sorted(options, key=sort_key)[:8]
+
+
+def _card_name_from_doc(doc: dict) -> str | None:
+    title = doc.get("title", "")
+    title_match = re.search(
+        r"\b([A-Z][A-Za-z0-9-]*(?:[- ][A-Z][A-Za-z0-9-]*)*\s+Card)\b",
+        title,
+    )
+    if title_match:
+        return title_match.group(1).strip()
+    if title.startswith("EcoCard"):
+        return "EcoCard"
+    if title.startswith("Crypto-Cash Back"):
+        return "Crypto-Cash Back Card"
+
+    doc_id = doc.get("doc_id", "")
+    match = re.search(r"doc_credit_cards_(.+?)_\d+$", doc_id)
+    if not match:
+        return None
+    return _CARD_NAMES_BY_DOC_SLUG.get(match.group(1))
+
+
+def _has_yes_after(text_l: str, label: str) -> bool | None:
+    label_l = label.lower()
+    if label_l not in text_l:
+        return None
+    match = re.search(re.escape(label_l) + r"[^.\n|:]*[:|]?\s*(yes|no)\b", text_l)
+    if match:
+        return match.group(1) == "yes"
+    return None
+
+
+def _card_facts(content: str) -> dict:
+    content_l = content.lower()
+    return {
+        "flat_cashback_percent": _first_float(content, _FLAT_CASHBACK_PATTERNS),
+        "annual_fee": _first_float(content, _ANNUAL_FEE_PATTERNS),
+        "minimum_credit_score": _first_int(content, _MIN_CREDIT_SCORE_PATTERNS),
+        "rho_bank_plus_required": (
+            True
+            if "rho" in content_l
+            and "bank+" in content_l
+            and "subscription required" in content_l
+            and "yes" in content_l
+            else None
+        ),
+        "invitation_only": _has_yes_after(content_l, "membership is by invitation only"),
+        "virtual_card_management": _has_yes_after(
+            content_l, "virtual card management available"
+        ),
+    }
+
+
+def _credit_card_options(query: str, docs: list[dict]) -> list[dict]:
+    profile = _query_profile(query)
+    if not profile["credit_card"] or profile["business"]:
+        return []
+
+    query_l = query.lower()
+    no_annual_fee_required = (
+        "no annual fee" in query_l
+        or "avoid annual fee" in query_l
+        or "without annual fee" in query_l
+        or "$0 annual fee" in query_l
+        or "zero annual fee" in query_l
+    )
+    subscription_available = (
+        "rho-bank+" in query_l
+        or "rho bank+" in query_l
+        or "rho‑bank+" in query_l
+        or "premium subscription" in query_l
+    ) and any(
+        term in query_l
+        for term in ("have", "has", "active", "through", "provided", "company", "subscription")
+    )
+
+    by_card: dict[str, dict] = {}
+    for doc in docs:
+        doc_id = doc.get("doc_id", "")
+        title = doc.get("title", "")
+        content = doc.get("content", "")
+        if "doc_credit_cards_" not in doc_id or _doc_is_business(doc_id, title):
+            continue
+        if "general" in doc_id or "logistics" in doc_id or "virtual_card" in doc_id:
+            continue
+
+        card_type = _card_name_from_doc(doc)
+        if not card_type:
+            continue
+
+        facts = _card_facts(content)
+        if not any(value is not None for value in facts.values()):
+            continue
+
+        option = by_card.setdefault(
+            card_type,
+            {
+                "card_type": card_type,
+                "flat_cashback_percent": None,
+                "annual_fee": None,
+                "rho_bank_plus_required": None,
+                "minimum_credit_score": None,
+                "invitation_only": None,
+                "virtual_card_management": None,
+                "fits_no_annual_fee_preference": None,
+                "subscription_condition_satisfied_by_user_statement": None,
+                "source_doc_ids": [],
+                "source_titles": [],
+            },
+        )
+        for key, value in facts.items():
+            if option[key] is None and value is not None:
+                option[key] = value
+        if doc_id not in option["source_doc_ids"]:
+            option["source_doc_ids"].append(doc_id)
+        if title and title not in option["source_titles"]:
+            option["source_titles"].append(title)
+
+    options = []
+    for option in by_card.values():
+        fee = option["annual_fee"]
+        option["fits_no_annual_fee_preference"] = fee == 0 if fee is not None else None
+        if option["rho_bank_plus_required"] is True:
+            option["subscription_condition_satisfied_by_user_statement"] = (
+                True if subscription_available else None
+            )
+        options.append(option)
+
+    def sort_key(option: dict) -> tuple:
+        fee_fits = option["fits_no_annual_fee_preference"]
+        if no_annual_fee_required:
+            fee_rank = 0 if fee_fits is True else 1 if fee_fits is None else 2
+        else:
+            fee_rank = 0
+        return (
+            fee_rank,
+            -float(option["flat_cashback_percent"] or 0.0),
+            1 if option["invitation_only"] else 0,
+            option["annual_fee"] if option["annual_fee"] is not None else 999999999,
+            option["card_type"],
         )
 
     return sorted(options, key=sort_key)[:8]
@@ -869,6 +1042,7 @@ def kb_search(query: str, top_k: int = 8, use_vector_fallback: bool = True) -> d
         catalog_docs = _catalog_candidates(query)
         docs.extend(catalog_docs)
         referral_options = _referral_options(query, docs)
+        credit_card_options = _credit_card_options(query, docs)
         results = _compact_results(docs, query, "bm25", top_k)
         used_vector = False
         min_needed = min(3, top_k)
@@ -899,6 +1073,7 @@ def kb_search(query: str, top_k: int = 8, use_vector_fallback: bool = True) -> d
             bm25_query_count=len(bm25_queries),
             catalog_candidate_count=len(catalog_docs),
             referral_option_count=len(referral_options),
+            credit_card_option_count=len(credit_card_options),
             used_vector=used_vector,
             vector_skipped_reason=vector_skipped_reason,
             best_bm25_score=best_score,
@@ -916,12 +1091,18 @@ def kb_search(query: str, top_k: int = 8, use_vector_fallback: bool = True) -> d
             "results": results,
             "referral_options": referral_options,
             "best_referral_option": referral_options[0] if referral_options else None,
+            "credit_card_options": credit_card_options,
+            "best_credit_card_option": (
+                credit_card_options[0] if credit_card_options else None
+            ),
             "guidance": (
                 "Use these snippets as evidence. If they answer the policy/tool "
                 "question, stop searching and act. If they are insufficient, run "
                 "one more specific kb_search query. If referral_options is present, "
                 "use that structured table for the numeric referral comparison and "
-                "do not run more KB searches for the same account comparison."
+                "do not run more KB searches for the same account comparison. If "
+                "credit_card_options is present, use that structured table for "
+                "card comparisons against the user's stated constraints."
             ),
         }
     except Exception as exc:
