@@ -35,7 +35,15 @@ printf '%s\n' "$CONFIG" | grep -q 'gemini-3.5-flash' || { printf 'gemini-3.5-fla
 printf 'Checking agent source contract...\n'
 grep -R 'gemini-3.5-flash' personal_agent cs_agent >/dev/null || { printf 'Model default not found in agent source.\n' >&2; exit 1; }
 grep -R 'session_id(tool_context)' personal_agent cs_agent >/dev/null || { printf 'Env tool calls do not obviously use session_id(tool_context).\n' >&2; exit 1; }
-grep -R 'context_id=session_id(tool_context)' personal_agent >/dev/null || { printf 'ask_customer_service does not obviously propagate contextId.\n' >&2; exit 1; }
+if grep -R 'context_id=session_id(tool_context)' personal_agent >/dev/null; then
+  :
+elif grep -R 'sid = session_id(tool_context)' personal_agent >/dev/null \
+  && grep -R 'context_id=sid' personal_agent >/dev/null; then
+  :
+else
+  printf 'ask_customer_service does not obviously propagate contextId.\n' >&2
+  exit 1
+fi
 
 printf 'Checking reachable agent cards on localhost...\n'
 for port in 9001 9002; do

@@ -12,6 +12,7 @@ require_google_api_key
 HARNESS="$(harness_dir "$ROOT")"
 UV_BIN="$(find_uv)"
 SAVE_TO="${1:-results/feedback}"
+CONCURRENCY="${CONCURRENCY:-1}"
 
 CMD=(
   "$UV_BIN" run a2a-hack run
@@ -19,11 +20,11 @@ CMD=(
   --cs-url http://localhost:9002
   --tasks feedback
   --save-to "$SAVE_TO"
+  --concurrency "$CONCURRENCY"
   --auto-resume
 )
 
-printf 'Running feedback split from %s\n' "$HARNESS"
+printf 'Running feedback split from %s with concurrency=%s\n' "$HARNESS" "$CONCURRENCY"
 print_run "${CMD[@]}"
 cd "$HARNESS"
 "${CMD[@]}"
-

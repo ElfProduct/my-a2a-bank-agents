@@ -9,7 +9,9 @@ the Redis 8 map-style reply work regardless of redis-py version."""
 
 import os
 import re
+import sys
 import struct
+import time
 
 import redis
 
@@ -21,6 +23,11 @@ EMBEDDING_DIM = 768
 
 _client = redis.Redis.from_url(REDIS_URL, decode_responses=False)
 _genai_client = None
+_PREVIEW_CHARS = 120
+
+
+def _preview(text: str) -> str:
+    return " ".join(text.split())[:_PREVIEW_CHARS]
 
 
 def _get_genai_client():
@@ -88,8 +95,10 @@ def kb_search_bm25(query: str, top_k: int = 5) -> list[dict]:
     Returns:
         Matching documents with doc_id, title, and full content.
     """
+    start = time.perf_counter()
     terms = re.findall(r"\w+", query.lower())
     if not terms:
+        print("[cs.rag] bm25 empty_query", file=sys.stderr, flush=True)
         return []
     # OR-join: RediSearch defaults to AND, which zeroes out long queries.
     or_query = "|".join(dict.fromkeys(terms))
@@ -98,7 +107,15 @@ def kb_search_bm25(query: str, top_k: int = 5) -> list[dict]:
         "LIMIT", "0", str(top_k),
         "RETURN", "2", "title", "content",
     )
-    return _parse_search_reply(reply)
+    docs = _parse_search_reply(reply)
+    elapsed = time.perf_counter() - start
+    print(
+        f"[cs.rag] bm25 top_k={top_k} results={len(docs)} "
+        f"elapsed={elapsed:.2f}s query={_preview(query)!r}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return docs
 
 
 def kb_search_vector(query: str, top_k: int = 5) -> list[dict]:
@@ -115,6 +132,7 @@ def kb_search_vector(query: str, top_k: int = 5) -> list[dict]:
         Matching documents with doc_id, title, and full content; or an error
         entry telling you to fall back to kb_search_bm25.
     """
+    start = time.perf_counter()
     try:
         vector = struct.pack(f"{EMBEDDING_DIM}f", *_embed([query])[0])
         reply = _client.execute_command(
@@ -125,8 +143,23 @@ def kb_search_vector(query: str, top_k: int = 5) -> list[dict]:
             "RETURN", "3", "title", "content", "score",
             "DIALECT", "2",
         )
-        return _strip_score(_parse_search_reply(reply))
+        docs = _strip_score(_parse_search_reply(reply))
+        elapsed = time.perf_counter() - start
+        print(
+            f"[cs.rag] vector top_k={top_k} results={len(docs)} "
+            f"elapsed={elapsed:.2f}s query={_preview(query)!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return docs
     except Exception as e:
+        elapsed = time.perf_counter() - start
+        print(
+            f"[cs.rag] vector_error type={type(e).__name__} "
+            f"elapsed={elapsed:.2f}s query={_preview(query)!r}",
+            file=sys.stderr,
+            flush=True,
+        )
         return [
             {
                 "error": f"Vector search unavailable ({type(e).__name__}). "

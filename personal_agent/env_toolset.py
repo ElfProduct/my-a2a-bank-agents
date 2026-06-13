@@ -6,6 +6,8 @@ call_env_tool fallback covers anything not yet in the fetched list."""
 
 import json
 import os
+import sys
+import time
 from typing import Any, Optional
 
 import httpx
@@ -27,11 +29,24 @@ def session_id(context: ReadonlyContext) -> str:
 
 
 async def _post_tool_call(sid: str, name: str, arguments: dict) -> dict:
+    start = time.perf_counter()
+    print(
+        f"[personal.env] context={sid} call tool={name} arg_keys={sorted(arguments)}",
+        file=sys.stderr,
+        flush=True,
+    )
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
             f"{ENV_API_URL}/sessions/{sid}/tools/{name}",
             json={"arguments": arguments},
             headers=_HEADERS,
+        )
+        elapsed = time.perf_counter() - start
+        print(
+            f"[personal.env] context={sid} result tool={name} "
+            f"status={resp.status_code} elapsed={elapsed:.2f}s",
+            file=sys.stderr,
+            flush=True,
         )
         if resp.status_code != 200:
             return {"error": True, "content": f"HTTP {resp.status_code}: {resp.text}"}
@@ -84,12 +99,21 @@ class EnvApiToolset(BaseToolset):
             # No session yet (e.g. agent card construction).
             return fallback
         sid = session_id(readonly_context)
+        start = time.perf_counter()
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
                 f"{ENV_API_URL}/sessions/{sid}/tools", headers=_HEADERS
             )
         resp.raise_for_status()
-        return [EnvApiTool(schema) for schema in resp.json()["tools"]] + fallback
+        tools = resp.json()["tools"]
+        elapsed = time.perf_counter() - start
+        print(
+            f"[personal.env] context={sid} fetched_tools={len(tools)} "
+            f"elapsed={elapsed:.2f}s",
+            file=sys.stderr,
+            flush=True,
+        )
+        return [EnvApiTool(schema) for schema in tools] + fallback
 
     async def close(self) -> None:
         pass

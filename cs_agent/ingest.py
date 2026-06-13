@@ -10,6 +10,7 @@ import json
 import os
 import struct
 import sys
+import time
 from pathlib import Path
 
 import redis
@@ -45,6 +46,7 @@ def load_documents() -> list[dict]:
 
 def build_index() -> None:
     """(Re)create the KB index and load every document, embedding if possible."""
+    total_start = time.perf_counter()
     client = redis.Redis.from_url(REDIS_URL, decode_responses=False)
     documents = load_documents()
     if not documents:
@@ -80,11 +82,17 @@ def build_index() -> None:
         )
     if misses:
         try:
-            for start in range(0, len(misses), EMBED_BATCH_SIZE):
-                idx = misses[start : start + EMBED_BATCH_SIZE]
+            for offset in range(0, len(misses), EMBED_BATCH_SIZE):
+                batch_start = time.perf_counter()
+                idx = misses[offset : offset + EMBED_BATCH_SIZE]
                 vectors = _embed([f"{documents[i]['title']}\n{documents[i]['content']}" for i in idx])
                 for i, vector in zip(idx, vectors):
                     embedding_bytes[i] = struct.pack(f"{EMBEDDING_DIM}f", *vector)
+                print(
+                    f"[ingest] embedded batch size={len(idx)} "
+                    f"elapsed={time.perf_counter() - batch_start:.2f}s",
+                    file=sys.stderr,
+                )
             print(f"[ingest] live-embedded {len(misses)} uncached documents", file=sys.stderr)
         except Exception as e:
             print(
@@ -100,7 +108,11 @@ def build_index() -> None:
             mapping["embedding"] = emb
         pipe.hset(f"{DOC_PREFIX}{doc['id']}", mapping=mapping)
     pipe.execute()
-    print(f"[ingest] indexed {len(documents)} documents into {KB_INDEX}", file=sys.stderr)
+    print(
+        f"[ingest] indexed {len(documents)} documents into {KB_INDEX} "
+        f"elapsed={time.perf_counter() - total_start:.2f}s",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":
