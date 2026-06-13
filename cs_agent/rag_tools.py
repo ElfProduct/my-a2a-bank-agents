@@ -8,26 +8,134 @@ Replies are parsed via execute_command so both the classic array reply and
 the Redis 8 map-style reply work regardless of redis-py version."""
 
 import os
+import json
 import re
-import sys
 import struct
-import time
+from functools import lru_cache
+from pathlib import Path
 
 import redis
+
+from observability import finish_observation, start_observation
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 KB_INDEX = "kb_idx"
 DOC_PREFIX = "doc:"
+KB_DOCUMENTS_DIR = Path(os.environ.get("KB_DOCUMENTS_DIR", "/app/kb/documents"))
 EMBEDDING_MODEL = "gemini-embedding-001"
 EMBEDDING_DIM = 768
+AGENT_NAME = "cs"
 
 _client = redis.Redis.from_url(REDIS_URL, decode_responses=False)
 _genai_client = None
-_PREVIEW_CHARS = 120
 
+_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "but",
+    "by",
+    "can",
+    "do",
+    "does",
+    "for",
+    "from",
+    "get",
+    "have",
+    "help",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "me",
+    "my",
+    "need",
+    "of",
+    "on",
+    "or",
+    "our",
+    "that",
+    "the",
+    "their",
+    "there",
+    "they",
+    "this",
+    "to",
+    "use",
+    "user",
+    "what",
+    "when",
+    "with",
+    "you",
+}
 
-def _preview(text: str) -> str:
-    return " ".join(text.split())[:_PREVIEW_CHARS]
+_WORKFLOW_HINTS = [
+    (
+        ("email", "address", "profile", "ownership"),
+        "email change identity verification account ownership dispute transfer human agent",
+    ),
+    (
+        ("verify", "verification", "identity", "dob", "birth", "phone"),
+        "identity verification log_verification date birth email phone address user",
+    ),
+    (
+        ("refer", "referral", "bonus", "roommate", "friend"),
+        "referral bonus referrer referred deposit annual limit rolling window submit_referral",
+    ),
+    (
+        ("credit", "card", "cashback", "cash", "rewards", "apr"),
+        "credit card rewards cash back annual fee Rho-Bank+ eligibility application",
+    ),
+    (
+        ("checking", "account", "atm", "foreign", "currency"),
+        "checking account monthly fee ATM foreign transaction currency debit card",
+    ),
+    (
+        ("savings", "apy", "interest", "yield", "withdrawal"),
+        "savings APY interest balance tier boost withdrawal minimum deposit",
+    ),
+    (
+        ("decline", "declined", "pin", "locked", "code"),
+        "card declined decline code pin lock fraud risk transfer unlock",
+    ),
+    (
+        ("dispute", "fraud", "unauthorized", "charge", "transaction"),
+        "transaction dispute fraud unauthorized charge provisional credit evidence",
+    ),
+    (
+        ("transfer", "human", "agent", "escalate", "supervisor"),
+        "transfer human agent escalation account ownership dispute security review",
+    ),
+]
+
+_SNIPPET_CHARS = 700
+_BUSINESS_TERMS = {
+    "business",
+    "businesses",
+    "commercial",
+    "company",
+    "companies",
+    "corporate",
+    "corporation",
+    "llc",
+    "paydex",
+    "startup",
+}
+_INTENT_TERMS = {
+    "credit_card": ("credit", "card", "cards", "cashback", "rewards", "apr"),
+    "checking": ("checking", "debit", "atm", "wire", "overdraft"),
+    "savings": ("savings", "apy", "interest", "yield", "withdrawal"),
+    "referral": ("refer", "referral", "referrals", "bonus", "roommate", "friend"),
+    "verification": ("verify", "verification", "identity", "dob", "birth", "phone", "email"),
+    "transfer": ("transfer", "human", "agent", "escalate", "supervisor"),
+    "dispute": ("dispute", "fraud", "unauthorized", "charge", "transaction"),
+}
+_CATALOG_TEXT_LIMIT = 4000
 
 
 def _get_genai_client():
@@ -44,17 +152,360 @@ def _embed(texts: list[str]) -> list[list[float]]:
     """Embed texts with gemini-embedding-001 via google-genai."""
     from google.genai import types
 
-    # Reduced-dim output is unnormalized; the index uses COSINE, so that's fine.
-    result = _get_genai_client().models.embed_content(
+    span = start_observation(
+        "gemini.embed",
+        AGENT_NAME,
         model=EMBEDDING_MODEL,
-        contents=texts,
-        config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIM),
+        batch_size=len(texts),
     )
-    return [e.values for e in result.embeddings]
+    try:
+        # Reduced-dim output is unnormalized; the index uses COSINE, so that's fine.
+        result = _get_genai_client().models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=texts,
+            config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIM),
+        )
+    except Exception as exc:
+        finish_observation(span, success=False, exception=exc)
+        raise
+    embeddings = [e.values for e in result.embeddings]
+    finish_observation(span, success=True, embedding_count=len(embeddings))
+    return embeddings
 
 
 def _decode(value) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def _terms(query: str) -> list[str]:
+    return re.findall(r"\w+", query.lower())
+
+
+def _important_terms(query: str) -> list[str]:
+    terms = [term for term in _terms(query) if len(term) > 2 and term not in _STOPWORDS]
+    return terms or _terms(query)
+
+
+def _hint_text(query: str) -> str:
+    lower = query.lower()
+    hints = []
+    for triggers, text in _WORKFLOW_HINTS:
+        if any(trigger in lower for trigger in triggers):
+            hints.append(text)
+    return " ".join(dict.fromkeys(" ".join(hints).split()))
+
+
+def _bm25_query(query: str) -> str:
+    terms = _important_terms(query)
+    return "|".join(dict.fromkeys(terms))
+
+
+def _expanded_bm25_queries(query: str) -> list[str]:
+    queries = [query]
+    hints = _hint_text(query)
+    if hints:
+        queries.append(f"{query} {hints}")
+        queries.append(hints)
+    return list(dict.fromkeys(q for q in queries if q.strip()))
+
+
+def _phrases(terms: list[str]) -> list[str]:
+    phrases = []
+    for i in range(len(terms) - 1):
+        phrases.append(f"{terms[i]} {terms[i + 1]}")
+    return phrases
+
+
+def _query_profile(query: str) -> dict:
+    query_terms = _important_terms(query)
+    hint_terms = _important_terms(_hint_text(query))
+    terms = set(query_terms)
+    return {
+        "query_terms": query_terms,
+        "hint_terms": hint_terms,
+        "all_terms": list(dict.fromkeys(query_terms + hint_terms)),
+        "phrases": _phrases(query_terms),
+        "business": bool(terms & _BUSINESS_TERMS),
+        "credit_card": any(term in terms for term in _INTENT_TERMS["credit_card"]),
+        "checking": any(term in terms for term in _INTENT_TERMS["checking"]),
+        "savings": any(term in terms for term in _INTENT_TERMS["savings"]),
+        "referral": any(term in terms for term in _INTENT_TERMS["referral"]),
+        "verification": any(term in terms for term in _INTENT_TERMS["verification"]),
+        "transfer": any(term in terms for term in _INTENT_TERMS["transfer"]),
+        "dispute": any(term in terms for term in _INTENT_TERMS["dispute"]),
+    }
+
+
+def _load_doc(path: Path) -> dict | None:
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    title = str(payload.get("title", ""))
+    content = str(payload.get("content", ""))
+    if not title and not content:
+        return None
+    return {
+        "doc_id": f"{DOC_PREFIX}{path.stem}",
+        "title": title,
+        "content": content[:_CATALOG_TEXT_LIMIT],
+        "_source": "bm25_catalog",
+    }
+
+
+@lru_cache(maxsize=1)
+def _public_doc_catalog() -> tuple[tuple[tuple[str, str], ...], ...]:
+    docs = []
+    if not KB_DOCUMENTS_DIR.exists():
+        return tuple()
+    for path in KB_DOCUMENTS_DIR.glob("*.json"):
+        doc = _load_doc(path)
+        if doc:
+            docs.append(tuple((key, str(value)) for key, value in doc.items()))
+    return tuple(docs)
+
+
+def _catalog_doc_matches(doc: dict, profile: dict) -> bool:
+    doc_id = doc.get("doc_id", "").lower()
+    title = doc.get("title", "").lower()
+    content = doc.get("content", "").lower()
+    doc_text = f"{title} {content}"
+    business_doc = _doc_is_business(doc_id, title)
+    if business_doc and not profile["business"]:
+        return False
+
+    if profile["credit_card"] and "doc:doc_credit_cards_" in doc_id:
+        return (
+            doc_id.endswith("_001")
+            or doc_id.endswith("_002")
+            or "apply" in title
+            or "eligibility" in title
+            or "cash back" in doc_text
+            or "annual fee" in doc_text
+        )
+    if profile["referral"] and profile["checking"]:
+        return (
+            ("doc:doc_checking_accounts_" in doc_id or "doc:doc_bank_accounts_" in doc_id)
+            and "referral" in doc_text
+        )
+    if profile["checking"] and "doc:doc_checking_accounts_" in doc_id:
+        return (
+            doc_id.endswith("_001")
+            or "at a glance" in title
+            or "foreign atm" in doc_text
+            or "direct deposit" in doc_text
+            or (profile["referral"] and "referral" in doc_text)
+        )
+    if profile["savings"] and "doc:doc_savings_accounts_" in doc_id:
+        return doc_id.endswith("_001") or "apy" in doc_text or "minimum deposit" in doc_text
+    return False
+
+
+def _catalog_candidates(query: str) -> list[dict]:
+    profile = _query_profile(query)
+    if not (
+        profile["credit_card"]
+        or profile["checking"]
+        or profile["savings"]
+        or profile["referral"]
+    ):
+        return []
+    docs = []
+    for row in _public_doc_catalog():
+        doc = dict(row)
+        if _catalog_doc_matches(doc, profile):
+            docs.append(doc)
+    return docs
+
+
+def _term_hits(text: str, terms: list[str]) -> int:
+    return sum(1 for term in terms if term and term in text)
+
+
+def _content_hits(text: str, terms: list[str]) -> int:
+    return sum(min(text.count(term), 3) for term in terms if term)
+
+
+def _doc_is_business(doc_id: str, title: str) -> bool:
+    haystack = f"{doc_id} {title}".lower()
+    return "business_" in haystack or "business " in haystack
+
+
+def _money_value(value: str) -> float:
+    return float(value.replace(",", ""))
+
+
+def _first_money(text: str, patterns: list[str]) -> float | None:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return _money_value(match.group(1))
+    return None
+
+
+def _query_deposit_amount(terms: list[str]) -> float | None:
+    amounts = []
+    for term in terms:
+        if term.isdigit():
+            value = float(term)
+            if value >= 50:
+                amounts.append(value)
+    return max(amounts) if amounts else None
+
+
+def _referral_numeric_boost(content_l: str, profile: dict) -> float:
+    referrer = _first_money(
+        content_l,
+        [
+            r"you earn(?:s)?(?:\:)?\s*\$([0-9,]+)",
+            r"your reward(?:\:)?\s*\$([0-9,]+)",
+            r"referrer bonus\s*\|\s*\$([0-9,]+)",
+            r"earn \$([0-9,]+) for each successful referral",
+        ],
+    )
+    referred = _first_money(
+        content_l,
+        [
+            r"person you refer receives \$([0-9,]+)",
+            r"they receive(?:\:)?\s*\$([0-9,]+)",
+            r"new member reward(?:\:)?\s*\$([0-9,]+)",
+            r"new member bonus\s*\|\s*\$([0-9,]+)",
+        ],
+    )
+    if referrer is None and referred is None:
+        return 0.0
+
+    boost = ((referrer or 0.0) + (referred or 0.0)) / 2
+    requested_deposit = _query_deposit_amount(profile["query_terms"])
+    required_deposit = _first_money(
+        content_l,
+        [
+            r"deposit at least \$([0-9,]+)",
+            r"required deposit\s*\|\s*\$([0-9,]+)",
+            r"qualifying deposit\s*\|\s*\$([0-9,]+)",
+            r"must deposit \$([0-9,]+)",
+        ],
+    )
+    if requested_deposit is not None and required_deposit is not None:
+        if required_deposit <= requested_deposit:
+            boost += 25
+        else:
+            boost -= 35
+    return boost
+
+
+def _doc_score(doc: dict, profile: dict) -> float:
+    doc_id = doc.get("doc_id", "")
+    title = doc.get("title", "")
+    content = doc.get("content", "")
+    doc_key = f"{doc_id} {title}".lower()
+    title_l = title.lower()
+    content_l = content.lower()
+    score = 0.0
+
+    score += 8 * _term_hits(title_l, profile["query_terms"])
+    score += 2 * _content_hits(content_l, profile["query_terms"])
+    score += 3 * _term_hits(title_l, profile["hint_terms"])
+    score += 0.5 * _content_hits(content_l, profile["hint_terms"])
+
+    for phrase in profile["phrases"]:
+        if phrase in title_l:
+            score += 12
+        if phrase in content_l:
+            score += 4
+
+    is_business = _doc_is_business(doc_id, title)
+    if is_business and not profile["business"]:
+        score -= 160
+    elif is_business and profile["business"]:
+        score += 10
+
+    if profile["credit_card"]:
+        if "doc_credit_cards_" in doc_key:
+            score += 14
+        if "doc_credit_cards_" in doc_key and " card:" in title_l:
+            score += 20
+        if "doc_business_credit_cards_" in doc_key and not profile["business"]:
+            score -= 18
+        if "credit card" in title_l:
+            score += 8
+        if "doc_credit_cards_credit_cards_(general)" in doc_key:
+            score -= 16
+        if "doc_credit_cards_credit_card_account_logistics" in doc_key:
+            score -= 16
+        if "internal:" in title_l:
+            score -= 18
+    if profile["checking"]:
+        if "doc_checking_accounts_" in doc_key:
+            score += 12
+        if "doc_bank_accounts_bank_accounts_(general)" in doc_key:
+            score += 5
+        if "checking" in title_l:
+            score += 8
+    if profile["savings"]:
+        if "doc_savings_accounts_" in doc_key:
+            score += 12
+        if "savings" in title_l:
+            score += 8
+    if profile["referral"]:
+        if "referral" in title_l:
+            score += 24
+        if "referral program" in content_l or "referral bonus" in content_l:
+            score += 12
+        if (
+            "referral" in content_l
+            and ("faq:" in title_l or "at a glance" in title_l)
+        ):
+            score += 50
+        if "submit_referral" in content_l:
+            score += 14
+        score += _referral_numeric_boost(content_l, profile)
+    elif "referral" in title_l:
+        score -= 20
+    if profile["verification"]:
+        if "log_verification" in content_l:
+            score += 18
+        if "identity verification" in content_l or "verify" in title_l:
+            score += 10
+    if profile["transfer"]:
+        if "transfer reason" in title_l or "human agent transfer" in title_l:
+            score += 24
+        if "transfer_to_human_agents" in content_l:
+            score += 18
+    if "ownership" in profile["all_terms"] and "account_ownership_dispute" in content_l:
+        score += 28
+    if "email" in profile["all_terms"] and "email" in content_l:
+        score += 6
+    if profile["dispute"] and "dispute" in title_l:
+        score += 10
+
+    if "atm" not in profile["all_terms"] and "atm" in title_l:
+        score -= 8
+    if "sweep" not in profile["all_terms"] and "automatic_sweep" in doc_key:
+        score -= 8
+
+    return score
+
+
+def _dedupe_and_rank(docs: list[dict], query: str) -> list[dict]:
+    profile = _query_profile(query)
+    best_by_id = {}
+    for position, doc in enumerate(docs):
+        doc_id = doc.get("doc_id")
+        if not doc_id:
+            continue
+        if _doc_is_business(doc_id, doc.get("title", "")) and not profile["business"]:
+            continue
+        scored = dict(doc)
+        scored["_rank_score"] = _doc_score(doc, profile)
+        scored["_rank_position"] = position
+        previous = best_by_id.get(doc_id)
+        if previous is None or scored["_rank_score"] > previous["_rank_score"]:
+            best_by_id[doc_id] = scored
+    return sorted(
+        best_by_id.values(),
+        key=lambda item: (-item["_rank_score"], item["_rank_position"]),
+    )
 
 
 def _parse_search_reply(reply) -> list[dict]:
@@ -78,10 +529,67 @@ def _parse_search_reply(reply) -> list[dict]:
     return out
 
 
+@lru_cache(maxsize=512)
+def _bm25_cached(or_query: str, top_k: int) -> tuple[tuple[tuple[str, str], ...], ...]:
+    reply = _client.execute_command(
+        "FT.SEARCH", KB_INDEX, or_query,
+        "LIMIT", "0", str(top_k),
+        "RETURN", "2", "title", "content",
+    )
+    docs = _parse_search_reply(reply)
+    return tuple(
+        tuple((key, str(value)) for key, value in doc.items())
+        for doc in docs
+    )
+
+
+def _from_cached(rows: tuple[tuple[tuple[str, str], ...], ...]) -> list[dict]:
+    return [dict(row) for row in rows]
+
+
 def _strip_score(docs: list[dict]) -> list[dict]:
     for doc in docs:
         doc.pop("score", None)
     return docs
+
+
+def _snippet(content: str, query_terms: list[str], max_chars: int = _SNIPPET_CHARS) -> str:
+    if len(content) <= max_chars:
+        return content.strip()
+    lower = content.lower()
+    hits = [lower.find(term) for term in query_terms if term and lower.find(term) >= 0]
+    center = min(hits) if hits else 0
+    start = max(0, center - max_chars // 4)
+    end = min(len(content), start + max_chars)
+    if end - start < max_chars:
+        start = max(0, end - max_chars)
+    snippet = content[start:end].strip()
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(content):
+        snippet += "..."
+    return snippet
+
+
+def _compact_results(docs: list[dict], query: str, source: str, top_k: int) -> list[dict]:
+    profile = _query_profile(query)
+    results = []
+    for doc in _dedupe_and_rank(docs, query):
+        doc_id = doc.get("doc_id")
+        if not doc_id:
+            continue
+        results.append(
+            {
+                "doc_id": doc_id,
+                "title": doc.get("title", ""),
+                "source": doc.get("_source", source),
+                "rank_score": round(doc.get("_rank_score", 0.0), 1),
+                "snippet": _snippet(doc.get("content", ""), profile["all_terms"]),
+            }
+        )
+        if len(results) >= top_k:
+            break
+    return results
 
 
 def kb_search_bm25(query: str, top_k: int = 5) -> list[dict]:
@@ -95,27 +603,25 @@ def kb_search_bm25(query: str, top_k: int = 5) -> list[dict]:
     Returns:
         Matching documents with doc_id, title, and full content.
     """
-    start = time.perf_counter()
-    terms = re.findall(r"\w+", query.lower())
+    terms = _important_terms(query)
+    span = start_observation(
+        "rag.bm25",
+        AGENT_NAME,
+        query_chars=len(query),
+        term_count=len(terms),
+        top_k=top_k,
+    )
     if not terms:
-        print("[cs.rag] bm25 empty_query", file=sys.stderr, flush=True)
+        finish_observation(span, success=True, result_count=0)
         return []
-    # OR-join: RediSearch defaults to AND, which zeroes out long queries.
-    or_query = "|".join(dict.fromkeys(terms))
-    reply = _client.execute_command(
-        "FT.SEARCH", KB_INDEX, or_query,
-        "LIMIT", "0", str(top_k),
-        "RETURN", "2", "title", "content",
-    )
-    docs = _parse_search_reply(reply)
-    elapsed = time.perf_counter() - start
-    print(
-        f"[cs.rag] bm25 top_k={top_k} results={len(docs)} "
-        f"elapsed={elapsed:.2f}s query={_preview(query)!r}",
-        file=sys.stderr,
-        flush=True,
-    )
-    return docs
+    try:
+        # OR-join: RediSearch defaults to AND, which zeroes out long queries.
+        results = _from_cached(_bm25_cached("|".join(dict.fromkeys(terms)), int(top_k)))
+    except Exception as exc:
+        finish_observation(span, success=False, exception=exc)
+        raise
+    finish_observation(span, success=True, result_count=len(results))
+    return results
 
 
 def kb_search_vector(query: str, top_k: int = 5) -> list[dict]:
@@ -132,7 +638,9 @@ def kb_search_vector(query: str, top_k: int = 5) -> list[dict]:
         Matching documents with doc_id, title, and full content; or an error
         entry telling you to fall back to kb_search_bm25.
     """
-    start = time.perf_counter()
+    span = start_observation(
+        "rag.vector", AGENT_NAME, query_chars=len(query), top_k=top_k
+    )
     try:
         vector = struct.pack(f"{EMBEDDING_DIM}f", *_embed([query])[0])
         reply = _client.execute_command(
@@ -143,26 +651,103 @@ def kb_search_vector(query: str, top_k: int = 5) -> list[dict]:
             "RETURN", "3", "title", "content", "score",
             "DIALECT", "2",
         )
-        docs = _strip_score(_parse_search_reply(reply))
-        elapsed = time.perf_counter() - start
-        print(
-            f"[cs.rag] vector top_k={top_k} results={len(docs)} "
-            f"elapsed={elapsed:.2f}s query={_preview(query)!r}",
-            file=sys.stderr,
-            flush=True,
-        )
-        return docs
+        results = _strip_score(_parse_search_reply(reply))
+        finish_observation(span, success=True, result_count=len(results))
+        return results
     except Exception as e:
-        elapsed = time.perf_counter() - start
-        print(
-            f"[cs.rag] vector_error type={type(e).__name__} "
-            f"elapsed={elapsed:.2f}s query={_preview(query)!r}",
-            file=sys.stderr,
-            flush=True,
-        )
+        finish_observation(span, success=False, exception=e)
         return [
             {
                 "error": f"Vector search unavailable ({type(e).__name__}). "
                 "Use kb_search_bm25 with keywords instead."
             }
         ]
+
+
+def kb_search(query: str, top_k: int = 8, use_vector_fallback: bool = True) -> dict:
+    """BM25-first compact search over the Rho-Bank public knowledge base.
+
+    Use this as the default KB tool. It searches cheap keyword/BM25 indexes
+    first with general workflow vocabulary, deduplicates documents, and returns
+    short snippets. It only calls vector search when BM25 returns too few
+    candidates.
+
+    Args:
+        query: Specific policy, product, procedure, or tool question.
+        top_k: Maximum number of snippets to return.
+        use_vector_fallback: Whether to use semantic vector search if BM25 is
+            insufficient.
+
+    Returns:
+        A dict with strategy metadata and compact document snippets.
+    """
+    top_k = max(1, min(int(top_k or 6), 10))
+    span = start_observation(
+        "rag.combined",
+        AGENT_NAME,
+        query_chars=len(query),
+        top_k=top_k,
+        use_vector_fallback=use_vector_fallback,
+    )
+    try:
+        docs = []
+        bm25_queries = _expanded_bm25_queries(query)
+        candidate_limit = min(max(top_k * 8, 20), 60)
+        for expanded in bm25_queries:
+            or_query = _bm25_query(expanded)
+            if not or_query:
+                continue
+            docs.extend(_from_cached(_bm25_cached(or_query, candidate_limit)))
+        catalog_docs = _catalog_candidates(query)
+        docs.extend(catalog_docs)
+        results = _compact_results(docs, query, "bm25", top_k)
+        used_vector = False
+        min_needed = min(3, top_k)
+        best_score = results[0]["rank_score"] if results else 0
+        bm25_insufficient = len(results) < min_needed or best_score < 10
+        specific_terms = _important_terms(query)
+        vector_allowed = len(specific_terms) >= 3 and len(query.strip()) >= 24
+        vector_skipped_reason = None
+        if use_vector_fallback and bm25_insufficient and vector_allowed:
+            vector_docs = kb_search_vector(query, top_k=top_k)
+            if vector_docs and "error" not in vector_docs[0]:
+                used_vector = True
+                existing = {item["doc_id"] for item in results}
+                for item in _compact_results(vector_docs, query, "vector", top_k):
+                    if item["doc_id"] not in existing:
+                        results.append(item)
+                        existing.add(item["doc_id"])
+                    if len(results) >= top_k:
+                        break
+        elif use_vector_fallback and bm25_insufficient:
+            vector_skipped_reason = "query_too_short_or_underspecified"
+        finish_observation(
+            span,
+            success=True,
+            result_count=len(results),
+            bm25_query_count=len(bm25_queries),
+            catalog_candidate_count=len(catalog_docs),
+            used_vector=used_vector,
+            vector_skipped_reason=vector_skipped_reason,
+            best_bm25_score=best_score,
+            bm25_insufficient=bm25_insufficient,
+        )
+        return {
+            "strategy": "bm25_first_vector_fallback",
+            "used_vector": used_vector,
+            "bm25_query_count": len(bm25_queries),
+            "catalog_candidate_count": len(catalog_docs),
+            "best_bm25_score": best_score,
+            "bm25_insufficient": bm25_insufficient,
+            "vector_skipped_reason": vector_skipped_reason,
+            "result_count": len(results),
+            "results": results,
+            "guidance": (
+                "Use these snippets as evidence. If they answer the policy/tool "
+                "question, stop searching and act. If they are insufficient, run "
+                "one more specific kb_search query."
+            ),
+        }
+    except Exception as exc:
+        finish_observation(span, success=False, exception=exc)
+        raise
